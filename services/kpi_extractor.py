@@ -39,7 +39,13 @@ def extract_kpi_values(df, col0):
 
 def extract_all_kpis_from_bytes(content: bytes, fname: str):
     fund, quarter = extract_fund_quarter(fname)
-    df = pd.read_excel(io.BytesIO(content), sheet_name="Portfolio_Input", header=None, engine="openpyxl")
+    df = pd.read_excel(
+        io.BytesIO(content),
+        sheet_name="Portfolio_Input",
+        header=None,
+        engine="openpyxl",
+        nrows=70
+    )
     starts = _company_start_cols(df)
 
     investments = []
