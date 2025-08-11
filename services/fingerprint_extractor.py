@@ -9,28 +9,23 @@ def _sha256(s: str) -> str:
 def _stable_json(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
-def _company_start_cols(df: pd.DataFrame):
-    # same logic you use elsewhere
+def _company_start_cols(df):
     return sorted([
         c for c in range(df.shape[1])
         if df.iloc[:, c].astype(str).str.fullmatch("Name of Investment", case=False).any()
     ])
 
-def _company_name_from_block(df: pd.DataFrame, col0: int):
-    # same as your working code, plus stricter empties filter
+def _company_name_from_block(df, col0):
     r_name = find_row(df, [col0], r"^Name of Investment$")
     if r_name is None:
         return None
     for cc in range(col0 + 1, df.shape[1]):
         nm = safe(df.iloc[r_name, cc])
         if nm:
-            nm = str(nm).strip()
-            if nm and nm.lower() not in {"", "nan", "none", "n/a", "-"}:
-                return nm
+            return nm.strip()
     return None
 
-def _extract_fields_hash(df: pd.DataFrame, col0: int):
-    # mirror of your parse_portfolio "fields" loop
+def _extract_fields_hash(df, col0):
     r_name = find_row(df, [col0], r"^Name of Investment$")
     if r_name is None:
         return None
@@ -45,14 +40,13 @@ def _extract_fields_hash(df: pd.DataFrame, col0: int):
             continue
         if isinstance(k, str) and stop_rgx.search(k):
             break
-        fields[str(k)] = v  # keep original casing like your RAG code
+        fields[str(k)] = v  # keep casing like in your RAG code
         r += 1
     if not fields:
         return None
     return _sha256(_stable_json(fields))
 
-def _extract_kpis_hash(df: pd.DataFrame, col0: int):
-    # same metric set & patterns as your KPI extractor
+def _extract_kpis_hash(df, col0):
     metrics = {"sales": None, "ebitda": None, "net_income": None, "net_debt": None}
     pats = {
         "sales": r"^\s*Sales\s*$",
@@ -69,7 +63,6 @@ def _extract_kpis_hash(df: pd.DataFrame, col0: int):
                     metrics[key] = float(str(raw).replace(",", ""))
                 except:
                     metrics[key] = None
-    # if all four are None, there is no KPI section → skip
     if all(v is None for v in metrics.values()):
         return None
     return _sha256(_stable_json(metrics))
@@ -81,7 +74,7 @@ def _parse_year_quarter(label: str):
     return int(m.group(2)), int(m.group(1))  # (year, quarter)
 
 def extract_fingerprints_from_bytes(content: bytes, fname: str):
-    fund, quarter_label = extract_fund_quarter(fname)  # e.g., ("MCIV", "Q3 2025")
+    fund, quarter_label = extract_fund_quarter(fname)  # e.g. ("MCIV","Q3 2025")
     year, quarter = _parse_year_quarter(quarter_label)
 
     df = pd.read_excel(io.BytesIO(content), sheet_name="Portfolio_Input", header=None, engine="openpyxl")
@@ -91,27 +84,26 @@ def extract_fingerprints_from_bytes(content: bytes, fname: str):
     for col0 in starts:
         name = _company_name_from_block(df, col0)
         if not name:
-            continue  # skip templates / empty columns
+            continue  # skip template/empty blocks
 
         field_hash = _extract_fields_hash(df, col0)
         kpi_hash   = _extract_kpis_hash(df, col0)
 
-        # if neither section exists, skip entirely (prevents empty investments)
+        # skip if both sections are empty to avoid empty investments
         if not field_hash and not kpi_hash:
             continue
 
-        # overall hash is a stable concat of available section hashes
         parts = [h for h in [field_hash, kpi_hash] if h]
         overall_hash = _sha256("|".join(parts))
 
         items.append({
             "company_name": name,
             "fund": fund,
+            "quarter_label": quarter_label,  # keep your original label
             "year": year,
             "quarter": quarter,
             "overall_hash": overall_hash,
             "field_hash": field_hash,
-            "kpi_hash": kpi_hash
+            "kpi_hash": kpi_hash,
         })
-
     return items
