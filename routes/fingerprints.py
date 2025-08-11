@@ -1,5 +1,5 @@
 # app/routes/fingerprints.py
-import io, traceback
+import traceback
 from flask import Blueprint, request, jsonify
 from services.fingerprint_extractor import extract_fingerprints_from_bytes
 
@@ -12,7 +12,8 @@ def fingerprints_route():
         return jsonify({"error": "file missing"}), 400
     try:
         items = extract_fingerprints_from_bytes(f.read(), f.filename)
-        return jsonify({"items": items, "count": len(items)})
+        # items already excludes empty names and empty sections
+        return jsonify({"items": items})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
