@@ -1,0 +1,9 @@
+# Local test files
+test_data/
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Python test scripts
+test_*.py

@@ -1,34 +1,56 @@
-import io, re, json, hashlib
+# app/services/fingerprint_extractor.py
+import io
+import re
+import json
+import hashlib
 import pandas as pd
-from utils.helpers import safe, find_row
+
+from utils.helpers import safe, find_row, grab_table, extract_esg
 from services.excel_parser import extract_fund_quarter  # returns (fund, "Qx YYYY")
 
+# ---------- small utils ----------
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def _stable_json(obj) -> str:
+    # deterministic JSON (sorted keys, no spaces)
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
-def _company_start_cols(df):
+def _parse_year_quarter(label: str):
+    # label like "Q3 2025"
+    m = re.match(r"Q([1-4])\s+(\d{4})", label or "", flags=re.I)
+    if not m:
+        return None, None
+    return int(m.group(2)), int(m.group(1))  # (year, quarter)
+
+# ---------- structure detection (same style as your code) ----------
+def _company_start_cols(df: pd.DataFrame):
     return sorted([
         c for c in range(df.shape[1])
         if df.iloc[:, c].astype(str).str.fullmatch("Name of Investment", case=False).any()
     ])
 
-def _company_name_from_block(df, col0):
+def _company_name_from_block(df: pd.DataFrame, col0: int):
     r_name = find_row(df, [col0], r"^Name of Investment$")
     if r_name is None:
         return None
     for cc in range(col0 + 1, df.shape[1]):
         nm = safe(df.iloc[r_name, cc])
         if nm:
-            return nm.strip()
+            s = str(nm).strip()
+            if not s or s.lower() in {"nan", "none", "n/a", "-", "name of investment"}:
+                continue
+            return s
     return None
 
-def _extract_fields_hash(df, col0):
+
+# ---------- section extractors (mirror your parse_portfolio/KPI logic) ----------
+def _extract_fields_dict(df: pd.DataFrame, col0: int):
+    """Key/value lines under 'Name of Investment' until a stop header."""
     r_name = find_row(df, [col0], r"^Name of Investment$")
     if r_name is None:
-        return None
+        return {}
+
     fields = {}
     stop_rgx = re.compile(r"(Year to Date|Actual Cash Flows|Year on Year|ESG Overview)", re.I)
     r = r_name + 1
@@ -40,13 +62,14 @@ def _extract_fields_hash(df, col0):
             continue
         if isinstance(k, str) and stop_rgx.search(k):
             break
-        fields[str(k)] = v  # keep casing like in your RAG code
+        # keep only truly filled values to avoid template noise
+        if v not in (None, "", "nan"):
+            fields[str(k)] = v
         r += 1
-    if not fields:
-        return None
-    return _sha256(_stable_json(fields))
+    return fields
 
-def _extract_kpis_hash(df, col0):
+def _extract_kpis_dict(df: pd.DataFrame, col0: int):
+    """Sales / EBITDA / Net income / Net debt as numbers (or None)."""
     metrics = {"sales": None, "ebitda": None, "net_income": None, "net_debt": None}
     pats = {
         "sales": r"^\s*Sales\s*$",
@@ -63,47 +86,90 @@ def _extract_kpis_hash(df, col0):
                     metrics[key] = float(str(raw).replace(",", ""))
                 except:
                     metrics[key] = None
-    if all(v is None for v in metrics.values()):
-        return None
-    return _sha256(_stable_json(metrics))
+    return metrics
 
-def _parse_year_quarter(label: str):
-    m = re.match(r"Q([1-4])\s+(\d{4})", label or "", flags=re.I)
-    if not m:
-        return None, None
-    return int(m.group(2)), int(m.group(1))  # (year, quarter)
+def _extract_text_blocks(df: pd.DataFrame, col0: int, cols_in_block: list[int]):
+    """Same headers list as your parse_portfolio, gathered as a dict of strings."""
+    hdrs = ["Investment Overview", "Significant Events", "YTD Q3 Analysis", "March 2025 Budget", "Exit Plans"]
+    text = {}
+    for h in hdrs:
+        rh = find_row(df, [col0], rf"^{re.escape(h)}$")
+        if rh is None:
+            continue
+        lines = []
+        for r in range(rh + 1, df.shape[0]):
+            cell = safe(df.iloc[r, col0])
+            if cell and any(x.lower() in cell.lower() for x in hdrs + ["ESG Overview"]):
+                break
+            if cell:
+                lines.append(cell)
+        if lines:
+            text[h] = "\n".join(lines)
+    return text
 
+# ---------- main entry ----------
 def extract_fingerprints_from_bytes(content: bytes, fname: str):
-    fund, quarter_label = extract_fund_quarter(fname)  # e.g. ("MCIV","Q3 2025")
+    """
+    Returns a list of dicts with:
+      fund, quarter_label, year, quarter, company,
+      fields_hash, kpi_hash, text_hash, esg_hash, overall_hash
+    Skips:
+      - blocks with empty company name
+      - blocks where all four sections are empty
+    """
+    fund, quarter_label = extract_fund_quarter(fname)  # e.g. ("MCIV", "Q3 2025")
     year, quarter = _parse_year_quarter(quarter_label)
 
     df = pd.read_excel(io.BytesIO(content), sheet_name="Portfolio_Input", header=None, engine="openpyxl")
     starts = _company_start_cols(df)
 
     items = []
-    for col0 in starts:
+    for i, col0 in enumerate(starts):
+        # Determine the column span for this company block (for ESG/text boundaries)
+        col1 = starts[i + 1] if i + 1 < len(starts) else df.shape[1]
+        cols = list(range(col0, col1))
+
+        # 1) Name guard — skip entire block if no company name
         name = _company_name_from_block(df, col0)
         if not name:
-            continue  # skip template/empty blocks
-
-        field_hash = _extract_fields_hash(df, col0)
-        kpi_hash   = _extract_kpis_hash(df, col0)
-
-        # skip if both sections are empty to avoid empty investments
-        if not field_hash and not kpi_hash:
             continue
 
-        parts = [h for h in [field_hash, kpi_hash] if h]
+        # 2) Extract sections (dicts). Each may be empty.
+        fields_dict = _extract_fields_dict(df, col0)
+        kpis_dict   = _extract_kpis_dict(df, col0)
+        text_blocks = _extract_text_blocks(df, col0, cols)
+        esg_dict    = extract_esg(df, cols)  # uses your helper
+
+        # 3) Compute hashes per section (None if section is logically empty)
+        fields_hash = _sha256(_stable_json(fields_dict)) if fields_dict else None
+
+        # KPI hash only if there is at least one numeric value present
+        kpi_hash = None
+        if any(v is not None for v in kpis_dict.values()):
+            kpi_hash = _sha256(_stable_json(kpis_dict))
+
+        text_hash = _sha256(_stable_json(text_blocks)) if text_blocks else None
+        esg_hash  = _sha256(_stable_json(esg_dict)) if esg_dict else None
+
+        # 4) If all four sections are empty, skip (prevents empty investments)
+        if not any([fields_hash, kpi_hash, text_hash, esg_hash]):
+            continue
+
+        # 5) Overall fingerprint from available section hashes (stable order)
+        parts = [h for h in [fields_hash, kpi_hash, text_hash, esg_hash] if h]
         overall_hash = _sha256("|".join(parts))
 
         items.append({
-            "company_name": name,
             "fund": fund,
-            "quarter_label": quarter_label,  # keep your original label
+            "quarter_label": quarter_label,
             "year": year,
             "quarter": quarter,
-            "overall_hash": overall_hash,
-            "field_hash": field_hash,
+            "company": name,
+            "fields_hash": fields_hash,
             "kpi_hash": kpi_hash,
+            "text_hash": text_hash,
+            "esg_hash": esg_hash,
+            "overall_hash": overall_hash
         })
+
     return items

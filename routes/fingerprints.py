@@ -13,7 +13,7 @@ def fingerprints_route():
     try:
         items = extract_fingerprints_from_bytes(f.read(), f.filename)
         # items already excludes empty names and empty sections
-        return jsonify({"items": items})
+        return jsonify(items)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
