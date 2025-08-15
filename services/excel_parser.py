@@ -1,8 +1,7 @@
 import re
 import pandas as pd
-import io
 from typing import List, Dict, Any
-from utils.helpers import safe, jdefault, find_row, grab_table, extract_esg
+from utils.helpers import safe, find_row, grab_table, extract_esg
 
 def extract_fund_quarter(fname: str):
     q = re.search(r"Q([1-4])[\s_-]*(\d{4})", fname, re.I)
@@ -11,7 +10,6 @@ def extract_fund_quarter(fname: str):
         f.group().replace(" ", "").replace("_", "").replace("-", "").upper() if f else "UNKNOWN",
         f"Q{q.group(1)} {q.group(2)}" if q else "UNKNOWN",
     )
-
 
 def parse_portfolio(file_stream, fname) -> List[Dict[str, Any]]:
     fund, quarter = extract_fund_quarter(fname)
@@ -33,6 +31,7 @@ def parse_portfolio(file_stream, fname) -> List[Dict[str, Any]]:
         if not name:
             continue
 
+        # Extract fields until we hit KPI/ESG section
         fields = {}
         stop_rgx = re.compile(r"(Year to Date|Actual Cash Flows|Year on Year|ESG Overview)", re.I)
         r = r_name + 1
@@ -46,19 +45,8 @@ def parse_portfolio(file_stream, fname) -> List[Dict[str, Any]]:
             fields[k] = v
             r += 1
 
+        # Removed KPI and cash flow table extraction entirely
         tables = {}
-        for label, pat in [
-            ("Year to Date - KPI", r"^Year to Date"),
-            ("Year on Year - KPI", r"^Year on Year"),
-            ("Actual Cash Flows", r"^Actual Cash Flows"),
-            ("Expected Cash Flows", r"^Expected Cash Flows"),
-            ("Action Plan Compliance", r"^Action Plan Compliance"),
-        ]:
-            sr = find_row(df, [col0], pat)
-            if sr is not None:
-                tbl = grab_table(df, sr, cols[:8])
-                if tbl:
-                    tables[label] = tbl
 
         esg = extract_esg(df, cols)
 
@@ -79,21 +67,25 @@ def parse_portfolio(file_stream, fname) -> List[Dict[str, Any]]:
                 text[h] = "\n".join(lines)
 
         investments.append({
-            "fund": fund, "quarter": quarter, "name": name,
-            "fields": fields, "tables": tables, "esg": esg, "text_blocks": text
+            "fund": fund,
+            "quarter": quarter,
+            "name": name,
+            "fields": fields,
+            "tables": tables,
+            "esg": esg,
+            "text_blocks": text
         })
     return investments
 
-
 def table_to_tsv(table):
     return "\n".join(["\t".join("" if v is None else str(v) for v in row) for row in table])
-
 
 def investments_to_docs(invs):
     docs = []
     for inv in invs:
         tag = f"[Company: {inv['name']}] [Fund: {inv['fund']}] [Quarter: {inv['quarter']}]"
 
+        # Text sections
         for section, text in inv["text_blocks"].items():
             docs.append({
                 "document": f"{tag}\n{section}\n\n{text}",
@@ -105,6 +97,7 @@ def investments_to_docs(invs):
                 }
             })
 
+        # ESG
         if inv.get("esg"):
             lines = [f"{k}: {v}" for k, v in inv["esg"].items() if v]
             docs.append({
@@ -117,6 +110,7 @@ def investments_to_docs(invs):
                 }
             })
 
+        # Fields
         if inv.get("fields"):
             lines = [f"{k}: {v}" for k, v in inv["fields"].items()]
             docs.append({
@@ -129,6 +123,7 @@ def investments_to_docs(invs):
                 }
             })
 
+        # No KPI tables anymore
         for tname, table in inv["tables"].items():
             docs.append({
                 "document": f"{tag}\n{tname}\n\n" + table_to_tsv(table),
